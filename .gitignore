@@ -1,0 +1,9 @@
+movie.mp4
+*.bak_*
+__pycache__/
+*.pyc
+.ruff_cache/
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.claude/
