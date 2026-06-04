@@ -8,7 +8,18 @@ Verified working config (1280x640 H.265, ~stable):
 
 ```
 RX: python usrp_ofdm_video.py --mode rxvideo --rx-uri "serial=U220213" --freq 1000 --rx-gain 30 --samp-rate 20 --osf 1.0 --codec h265 --rx-bits 18 --duration 60
-TX: python usrp_ofdm_video.py --mode txvideo --tx-uri "serial=U220202" --freq 1000 --gain 55 --samp-rate 20 --osf 1.0 --codec h265 --h264-crf 28 --fwidth 1280 --fheight 640 --tx-fps 20 --preencode --duration 90
+TX: python usrp_ofdm_video.py --mode txvideo --tx-uri "serial=U220202" --freq 1000 --gain 55 --samp-rate 20 --osf 1.0 --codec h265 --h264-crf 28 --fwidth 1280 --fheight 640 --tx-fps 20 --preencode --duration 90 --tx-chan 1
+```
+
+`--tx-chan 1` makes **U220202** transmit on **RF B's `TX/RX` jack** instead of RF A's — its original RF A `TX/RX` connector is damaged. On a B210 the front-end channels are `0 = RF A` / `1 = RF B`, and only the `TX/RX` jack of each can transmit (the `RX2` jack is receive-only). `--rx-chan` does the same for the RX host; both default to `0` (RF A). Remember to physically move the antenna/cable to the **RF B `TX/RX`** SMA on U220202.
+
+### 4120 MHz config
+
+Same as above but at 4.12 GHz — higher path loss, so bump the gains (`--gain 65` TX, `--rx-gain 45` RX):
+
+```
+RX: python usrp_ofdm_video.py --mode rxvideo --rx-uri "serial=U220213" --freq 4120 --rx-gain 45 --samp-rate 20 --osf 1.0 --codec h265 --rx-bits 18 --duration 60
+TX: python usrp_ofdm_video.py --mode txvideo --tx-uri "serial=U220202" --freq 4120 --gain 65 --samp-rate 20 --osf 1.0 --codec h265 --h264-crf 28 --fwidth 1280 --fheight 640 --tx-fps 20 --preencode --duration 90 --tx-chan 1
 ```
 
 `--preencode` (file source only): encodes the whole clip once at startup, then the transmit loop only packetizes/modulates/pushes — so TX fps is no longer capped by encoder throughput (e.g. 720p H.265 ≈ 10 fps online). Big startup pause while it encodes, then it transmits the buffered frames in a loop. Raise `--samp-rate` (both ends) for more airtime headroom at high resolution.

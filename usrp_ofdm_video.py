@@ -891,10 +891,11 @@ def _uhd_tune(freq: float):
     return uhd.libpyuhd.types.tune_request(float(freq))
 
 
-def _make_stream_args():
-    """fc32 (主机端 complex64) / sc16 (空口 int16 复数), 单通道."""
+def _make_stream_args(chan: int = 0):
+    """fc32 (主机端 complex64) / sc16 (空口 int16 复数), 单通道.
+    chan: B210 RF 前端通道. 0=RF A (TX/RX/RX2 口), 1=RF B (TX/RX/RX2 口)."""
     st = uhd.usrp.StreamArgs("fc32", "sc16")
-    st.channels = [0]
+    st.channels = [chan]
     return st
 
 
@@ -917,23 +918,26 @@ class UsrpTX:
     """TX-only USRP x310. 通过 daemon 线程持续 send() 实现 cyclic 效果."""
 
     def __init__(self, uri: str, freq: float, tx_gain: float,
-                 streaming: bool = True):
+                 streaming: bool = True, chan: int = 0):
         if not HAS_USRP:
             raise RuntimeError("uhd 未安装")
-        print(f"[TX]  连接 USRP {uri} ...")
+        self.chan = int(chan)
+        print(f"[TX]  连接 USRP {uri} (chan={self.chan}) ...")
         self.usrp = uhd.usrp.MultiUSRP(uri)
-        self.usrp.set_tx_rate(float(RF_RATE), 0)
-        self.usrp.set_tx_freq(_uhd_tune(freq), 0)
-        self.usrp.set_tx_gain(float(tx_gain), 0)
+        self.usrp.set_tx_rate(float(RF_RATE), self.chan)
+        self.usrp.set_tx_freq(_uhd_tune(freq), self.chan)
+        self.usrp.set_tx_gain(float(tx_gain), self.chan)
         try:
-            self.usrp.set_tx_bandwidth(float(RF_BANDWIDTH), 0)
+            self.usrp.set_tx_bandwidth(float(RF_BANDWIDTH), self.chan)
         except Exception:
             pass
         try:
-            self.usrp.set_tx_antenna("TX/RX", 0)
+            # B210: chan0=RF A 的 TX/RX 口, chan1=RF B 的 TX/RX 口. 天线名都是
+            # "TX/RX" (能发能收), 选哪个物理 SMA 由 chan 决定.
+            self.usrp.set_tx_antenna("TX/RX", self.chan)
         except Exception:
             pass
-        self.tx_streamer = self.usrp.get_tx_stream(_make_stream_args())
+        self.tx_streamer = self.usrp.get_tx_stream(_make_stream_args(self.chan))
         self.streaming = streaming
         # cyclic 仿真用的状态
         self._burst = None
@@ -941,8 +945,9 @@ class UsrpTX:
         self._loop_thread = None
         self._loop_stop = threading.Event()
         mode = "streaming(one-shot)" if streaming else "cyclic(thread-emul)"
+        port = "RF B(TX/RX)" if self.chan == 1 else "RF A(TX/RX)"
         print(f"[TX]  就绪  Freq={freq/1e9:.2f}GHz  SR={RF_RATE/1e6:.1f}MHz  "
-              f"TX={tx_gain}dB  {mode}")
+              f"TX={tx_gain}dB  chan={self.chan}({port})  {mode}")
 
     def _cyclic_loop(self):
         """daemon 线程: 反复 send() 当前 burst 模拟 cyclic 发射."""
@@ -998,23 +1003,26 @@ class UsrpRX:
     """RX-only USRP x310. capture() 阻塞读 rx_buffer 个 RF 样本后下采样."""
 
     def __init__(self, uri: str, freq: float, rx_gain: float,
-                 rx_buffer: int = 2 ** 18):
+                 rx_buffer: int = 2 ** 18, chan: int = 0):
         if not HAS_USRP:
             raise RuntimeError("uhd 未安装")
-        print(f"[RX]  连接 USRP {uri} ...")
+        self.chan = int(chan)
+        print(f"[RX]  连接 USRP {uri} (chan={self.chan}) ...")
         self.usrp = uhd.usrp.MultiUSRP(uri)
-        self.usrp.set_rx_rate(float(RF_RATE), 0)
-        self.usrp.set_rx_freq(_uhd_tune(freq), 0)
-        self.usrp.set_rx_gain(float(rx_gain), 0)
+        self.usrp.set_rx_rate(float(RF_RATE), self.chan)
+        self.usrp.set_rx_freq(_uhd_tune(freq), self.chan)
+        self.usrp.set_rx_gain(float(rx_gain), self.chan)
         try:
-            self.usrp.set_rx_bandwidth(float(RF_BANDWIDTH), 0)
+            self.usrp.set_rx_bandwidth(float(RF_BANDWIDTH), self.chan)
         except Exception:
             pass
         try:
-            self.usrp.set_rx_antenna("TX/RX", 0)
+            # B210: chan0=RF A 的 TX/RX 口, chan1=RF B 的 TX/RX 口 (RX 用 TX/RX
+            # 天线名收发; 若想用纯收的 RX2 物理口可改成 "RX2").
+            self.usrp.set_rx_antenna("TX/RX", self.chan)
         except Exception:
             pass
-        self.rx_streamer = self.usrp.get_rx_stream(_make_stream_args())
+        self.rx_streamer = self.usrp.get_rx_stream(_make_stream_args(self.chan))
         self.rx_buffer = int(rx_buffer)
         self._md = uhd.types.RXMetadata()
         # 不再用连续流: capture() 每次按需有限取样, 避免处理间隙溢出
@@ -1024,8 +1032,9 @@ class UsrpRX:
                 self.capture()
             except Exception:
                 pass
+        port = "RF B(TX/RX)" if self.chan == 1 else "RF A(TX/RX)"
         print(f"[RX]  就绪  Freq={freq/1e9:.2f}GHz  RX={rx_gain}dB  "
-              f"buf={rx_buffer}")
+              f"chan={self.chan}({port})  buf={rx_buffer}")
 
     def capture_rf(self) -> np.ndarray:
         """只 recv 原始 RF 样本, 不下采样. 把下采样留给消费线程: 采集线程
@@ -2215,7 +2224,8 @@ def run_txvideo(args):
                 print("[TXVID] 预编码无输出, 回退实时编码")
                 pre = None
 
-    tx = UsrpTX(args.tx_uri, args.freq * 1e6, args.gain, streaming=False)
+    tx = UsrpTX(args.tx_uri, args.freq * 1e6, args.gain, streaming=False,
+                chan=args.tx_chan)
     cv2.namedWindow("TX", cv2.WINDOW_NORMAL)
     min_period = 1.0 / max(args.tx_fps, 0.1)
     mode_tag = "预编码缓冲" if pre is not None else "实时编码"
@@ -2292,7 +2302,7 @@ def run_rxvideo(args):
         print("[错误] 未安装 uhd")
         return
     rx = UsrpRX(args.rx_uri, args.freq * 1e6, args.rx_gain,
-                rx_buffer=2 ** args.rx_bits)
+                rx_buffer=2 ** args.rx_bits, chan=args.rx_chan)
     cv2.namedWindow("RX", cv2.WINDOW_NORMAL)
     h264_dec = _H264Decoder() if args.codec in ("h264", "h265") else None
 
@@ -2480,6 +2490,12 @@ def main():
                    help="TX 增益 dB")
     p.add_argument("--rx-gain", type=float, default=RX_GAIN_DEFAULT,
                    help="RX 增益 dB")
+    p.add_argument("--tx-chan", type=int, default=0, choices=[0, 1],
+                   help="B210 发射 RF 前端通道: 0=RF A 的 TX/RX 口(默认), "
+                        "1=RF B 的 TX/RX 口. 原 TX/RX 口损坏时改用 1.")
+    p.add_argument("--rx-chan", type=int, default=0, choices=[0, 1],
+                   help="B210 接收 RF 前端通道: 0=RF A 的 TX/RX 口(默认), "
+                        "1=RF B 的 TX/RX 口.")
     p.add_argument("--duration", type=float, default=60)
     p.add_argument("--fwidth", type=int, default=320, help="视频帧宽度 (彩色)")
     p.add_argument("--fheight", type=int, default=240, help="视频帧高度 (彩色)")
