@@ -2408,6 +2408,12 @@ def run_rxvideo(args):
                         last_bytes = len(full)
                         fps_times.append(time.time())
                         shown_fid = fid
+                        # 出一帧就停止扫描本 buffer 余下的 cyclic 重复包: 一个
+                        # capture 窗口里同一帧通常重复 ~6 次 (~120 个检测点全解会
+                        # 吃满 ~80ms, 拖慢 buffer 周转 -> 唯一帧率被压到 ~7fps).
+                        # 解到第一帧新帧即 break, buffer 周转快数倍, 唯一帧率大涨.
+                        # 下一帧由后续 capture (它在那帧 hold 窗口里占主导) 收下.
+                        break
             # 原分辨率显示 (窗口可手动拖拽缩放), 不再强制缩到 480x360
             if last_rx_frame is not None:
                 cv2.imshow("RX", last_rx_frame)
