@@ -22,7 +22,9 @@ RX: python usrp_ofdm_video.py --mode rxvideo --rx-uri "serial=U220213" --freq 41
 TX: python usrp_ofdm_video.py --mode txvideo --tx-uri "serial=U220202" --freq 4120 --gain 65 --samp-rate 20 --osf 1.0 --codec h265 --h264-crf 28 --fwidth 1280 --fheight 640 --tx-fps 20 --preencode --duration 90 --tx-chan 1
 ```
 
-`--preencode` (file source only): encodes the whole clip once at startup, then the transmit loop only packetizes/modulates/pushes — so TX fps is no longer capped by encoder throughput (e.g. 720p H.265 ≈ 10 fps online). Big startup pause while it encodes, then it transmits the buffered frames in a loop. Raise `--samp-rate` (both ends) for more airtime headroom at high resolution.
+`--preencode` (file source only): encodes the whole clip once at startup, then the transmit loop only packetizes/modulates/pushes — so TX fps is no longer capped by encoder throughput (e.g. 720p H.265 ≈ 10 fps online). Big startup pause while it encodes, then it transmits the buffered frames in a loop. 
+`--preencode-max` control perencode frame ,default = 2000. 
+Raise `--samp-rate` (both ends) for more airtime headroom at high resolution.
 
 ### `--rx-bits` must fit inside the TX hold
 
