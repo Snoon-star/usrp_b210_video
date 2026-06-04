@@ -87,9 +87,15 @@ except ImportError:
 
 CARRIER_FREQ_DEFAULT = 5.8e9           # 5.8 GHz (B210 量程 70MHz~6GHz)
 SAMPLE_RATE_BB = 5e6                   # 基带采样率 (B210 over USB3 降速防溢出)
-OSF = 1.5                              # 过采样因子
-RF_RATE = int(SAMPLE_RATE_BB * OSF)    # B210 空口 12 MHz (原 X310 为 30 MHz)
+OSF = 1.5                              # 过采样因子 (运行时由 --osf 覆盖)
+RF_RATE = int(SAMPLE_RATE_BB * OSF)    # B210 空口 (= OSF * 基带率)
 RF_BANDWIDTH = 6e6
+# BB<->RF 有理重采样比 (= OSF). UP==DOWN 时 (OSF=1) 重采样直通, 省掉 scipy
+# resample_poly 这个 RX 端最大头开销 (实测占接收计算 ~70%, 且在采集线程里会
+# 撕出接收盲区). OFDM 自带 12/64 空子载波做保护带, 不过采样也不混叠 (即 802.11a
+# 的做法). 由 main() 据 --osf 设置.
+_RESAMPLE_UP = 3
+_RESAMPLE_DOWN = 2
 # UBX-160 / SBX-120 / CBX-120 子板典型增益范围 0-31.5 dB.
 # 注意 x310 的"增益"是放大量 (Pluto 的负数是衰减), 这里默认中等值.
 TX_GAIN_DEFAULT = 10
@@ -682,13 +688,19 @@ def decode_packet(rx: np.ndarray, start: int, max_data_sym: int = 600):
 # ============================================================================
 
 def upsample_to_rf(x: np.ndarray) -> np.ndarray:
-    """20MHz -> 30MHz, 用有理变换 3/2."""
-    return sps.resample_poly(x, up=3, down=2).astype(np.complex64)
+    """BB -> RF 有理上采样 (OSF = UP/DOWN). OSF=1 时直通, 省掉 resample 开销."""
+    if _RESAMPLE_UP == _RESAMPLE_DOWN:
+        return np.ascontiguousarray(x, dtype=np.complex64)
+    return sps.resample_poly(x, up=_RESAMPLE_UP,
+                             down=_RESAMPLE_DOWN).astype(np.complex64)
 
 
 def downsample_to_bb(x: np.ndarray) -> np.ndarray:
-    """30MHz -> 20MHz, 用有理变换 2/3."""
-    return sps.resample_poly(x, up=2, down=3).astype(np.complex64)
+    """RF -> BB 有理下采样 (1/OSF). OSF=1 时直通 (省掉 RX 端最大头开销)."""
+    if _RESAMPLE_UP == _RESAMPLE_DOWN:
+        return np.ascontiguousarray(x, dtype=np.complex64)
+    return sps.resample_poly(x, up=_RESAMPLE_DOWN,
+                             down=_RESAMPLE_UP).astype(np.complex64)
 
 
 # ============================================================================
@@ -1015,8 +1027,10 @@ class UsrpRX:
         print(f"[RX]  就绪  Freq={freq/1e9:.2f}GHz  RX={rx_gain}dB  "
               f"buf={rx_buffer}")
 
-    def capture(self) -> np.ndarray:
-        """每次按需取 rx_buffer 个 RF 样本后自动停流, 避免连续流在处理间隙溢出."""
+    def capture_rf(self) -> np.ndarray:
+        """只 recv 原始 RF 样本, 不下采样. 把下采样留给消费线程: 采集线程
+        专注 recv 即可把空口占空比拉满 (下采样若放在采集线程里, 每次 ~20ms
+        都是接收盲区, 会丢掉大量空口数据 -> 帧难凑齐). OSF=1 时下采样本身直通."""
         cmd = uhd.types.StreamCMD(uhd.types.StreamMode.num_done)
         cmd.num_samps = self.rx_buffer
         cmd.stream_now = True
@@ -1030,9 +1044,11 @@ class UsrpRX:
             filled += n
         if filled == 0:
             return np.zeros(0, dtype=np.complex64)
-        if filled < self.rx_buffer:
-            rf = rf[:filled]
-        return downsample_to_bb(rf)
+        return rf[:filled] if filled < self.rx_buffer else rf
+
+    def capture(self) -> np.ndarray:
+        """recv + 下采样 (兼容旧调用方: rxprobe / 暖机等)."""
+        return downsample_to_bb(self.capture_rf())
 
     def close(self):
         _stop_rx_continuous(self.rx_streamer)
@@ -1423,7 +1439,7 @@ def run_loopback(args):
 # 异步线程化模式 (单台 / 双台 Pluto 共用解码逻辑)
 # ============================================================================
 
-_BURST_LIMIT = 2 ** 20      # baseband sample 上限 (抬高以容纳更大分辨率/大帧)
+_BURST_LIMIT = 2 ** 21      # baseband sample 上限 (抬高以容纳 720p 等大帧, 防截断)
 
 
 class FrameProducer:
@@ -2102,73 +2118,153 @@ def run_rxprobe(args):
 # 主入口
 # ============================================================================
 
+def _build_frame_burst(jpg: bytes, frame_idx: int, args):
+    """把一帧已编码字节流切包 -> OFDM baseband 波形 burst. 返回 (burst, n_pkt).
+
+    纯 numpy/FFT, 无视频编码; 用于实时与预编码两条发射路径共用."""
+    silence = np.zeros(NSYM * 4, dtype=np.complex64)
+    parts = []
+    if args.fec:
+        # FEC: 切 k 个数据块 -> 编码 n 个块, 每块前置 5 字节子头(k, frame_len)
+        k, n_pkt, frame_len, enc = fec.fec_pack_frame(
+            jpg, args.fec_block, args.fec_overhead)
+        sub = struct.pack("<BI", k, frame_len)
+        for i in range(n_pkt):
+            wf, _ = build_packet_waveform(
+                sub + enc[i].tobytes(), frame_idx, i, n_pkt)
+            parts.append(wf)
+            parts.append(silence)
+    else:
+        chunks = split_payload(jpg)
+        n_pkt = len(chunks)
+        for pid, chunk in enumerate(chunks):
+            wf, _ = build_packet_waveform(chunk, frame_idx, pid, n_pkt)
+            parts.append(wf)
+            parts.append(silence)
+    burst = np.concatenate(parts).astype(np.complex64)
+    if len(burst) > _BURST_LIMIT:
+        print(f"\n[WARN] burst {len(burst)} > {_BURST_LIMIT}, 截断 "
+              f"(提高 --h264-crf 或降低分辨率以缩小最大帧)")
+        burst = burst[:_BURST_LIMIT]
+    return burst, n_pkt
+
+
+def _preencode_file(args):
+    """离线把整段视频逐帧编码成 [(缩略图, 编码字节)] 列表, 一次性付清编码 CPU.
+
+    仅文件源可用 (摄像头/图案无法预读未来). 之后发射循环只切包/调制/推送,
+    不再受编码器 fps (如 720p ~10fps) 限制 -> 发射帧率可冲到空口/装配上限.
+    缩略图存 320x240 省内存; --preencode-max 限制帧数防超大文件吃光内存."""
+    cap = open_video_source(args.source, args.input)
+    if cap is None:
+        return None
+    enc = None
+    if args.codec in ("h264", "h265"):
+        enc = _H264Encoder(args.fwidth, args.fheight, args.h264_bitrate,
+                           args.h264_gop, preset=args.h264_preset,
+                           crf=args.h264_crf)
+    frames = []
+    t0 = time.time()
+    print(f"[TXVID] 预编码整段视频中 (一次性, codec={args.codec} "
+          f"{args.fwidth}x{args.fheight} crf={args.h264_crf}) ...")
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if enc is not None:
+                jpg = enc.encode(frame)
+                if not jpg:                 # 编码器预热, 跳过该源帧
+                    continue
+            else:
+                jpg = frame_to_jpeg_bytes(frame, args.fwidth, args.fheight,
+                                          args.jpeg, codec=args.codec)
+            frames.append((cv2.resize(frame, (320, 240)), jpg))
+            if len(frames) % 30 == 0:
+                print(f"\r  已编码 {len(frames)} 帧 ({time.time()-t0:.1f}s)",
+                      end="")
+            if len(frames) >= args.preencode_max:
+                print(f"\n  达到 --preencode-max={args.preencode_max} 上限, 停止")
+                break
+    finally:
+        cap.release()
+    if frames:
+        sizes = [len(j) for _, j in frames]
+        print(f"\n[TXVID] 预编码完成: {len(frames)} 帧, {time.time()-t0:.1f}s, "
+              f"帧字节 avg={sum(sizes)//len(sizes)} max={max(sizes)}")
+    return frames
+
+
 def run_txvideo(args):
     """纯发射进程: 持续把视频帧编码/切包/cyclic 发射. 配合另一台/另一进程的
     rxvideo 使用. 收发分进程可避免 dual 单进程里 TX 线程与 RX 重解码的
-    GIL/USB 争用 (那会导致 TX 欠载、RX 捕获被打碎而解不出)."""
+    GIL/USB 争用 (那会导致 TX 欠载、RX 捕获被打碎而解不出).
+
+    --preencode (仅文件源): 启动时一次性编码整段视频, 之后发射不再占用编码 CPU,
+    发射帧率不再被编码器吞吐 (如 720p ~10fps) 卡住."""
     if not HAS_USRP:
         print("[错误] 未安装 uhd")
         return
+    pre = None
+    if args.preencode:
+        if args.source != "file":
+            print("[TXVID] --preencode 仅支持 --source file, 已忽略 (回退实时编码)")
+        else:
+            pre = _preencode_file(args)
+            if not pre:
+                print("[TXVID] 预编码无输出, 回退实时编码")
+                pre = None
+
     tx = UsrpTX(args.tx_uri, args.freq * 1e6, args.gain, streaming=False)
-    cap = open_video_source(args.source, args.input)
     cv2.namedWindow("TX", cv2.WINDOW_NORMAL)
-    h264_enc = None
-    if args.codec in ("h264", "h265"):
-        h264_enc = _H264Encoder(args.fwidth, args.fheight,
-                                args.h264_bitrate, args.h264_gop,
-                                preset=args.h264_preset, crf=args.h264_crf)
     min_period = 1.0 / max(args.tx_fps, 0.1)
+    mode_tag = "预编码缓冲" if pre is not None else "实时编码"
     print(f"[TXVID] 发射视频 {args.tx_uri} @ {args.freq:.1f}MHz TX={args.gain}dB "
-          f"codec={args.codec} {args.fwidth}x{args.fheight}")
+          f"codec={args.codec} {args.fwidth}x{args.fheight} ({mode_tag})")
+
+    # 实时路径所需 (预编码路径不用)
+    cap = None
+    h264_enc = None
+    if pre is None:
+        cap = open_video_source(args.source, args.input)
+        if args.codec in ("h264", "h265"):
+            h264_enc = _H264Encoder(args.fwidth, args.fheight,
+                                    args.h264_bitrate, args.h264_gop,
+                                    preset=args.h264_preset, crf=args.h264_crf)
+
     frame_idx = 0
     t0 = time.time()
     try:
         while time.time() - t0 < args.duration:
             tframe = time.time()
-            frame = get_next_frame(cap, frame_idx)
-            if frame is None:
-                break
-            if h264_enc is not None:
-                jpg = h264_enc.encode(frame)
-                if not jpg:
-                    cv2.imshow("TX", cv2.resize(frame, (480, 360)))
-                    cv2.waitKey(1)
-                    frame_idx += 1
-                    continue
+            if pre is not None:
+                # 预编码缓冲: 取已编码字节 (循环播放), 只切包/调制/推送
+                thumb, jpg = pre[frame_idx % len(pre)]
+                disp = thumb
             else:
-                jpg = frame_to_jpeg_bytes(frame, args.fwidth, args.fheight,
-                                          args.jpeg, codec=args.codec)
-            silence = np.zeros(NSYM * 4, dtype=np.complex64)
-            parts = []
-            if args.fec:
-                # FEC: 切 k 个数据块 -> 编码 n 个块, 每块前置 5 字节子头(k, frame_len)
-                k, n_pkt, frame_len, enc = fec.fec_pack_frame(
-                    jpg, args.fec_block, args.fec_overhead)
-                sub = struct.pack("<BI", k, frame_len)
-                for i in range(n_pkt):
-                    wf, _ = build_packet_waveform(
-                        sub + enc[i].tobytes(), frame_idx, i, n_pkt)
-                    parts.append(wf)
-                    parts.append(silence)
-            else:
-                chunks = split_payload(jpg)
-                n_pkt = len(chunks)
-                for pid, chunk in enumerate(chunks):
-                    wf, _ = build_packet_waveform(chunk, frame_idx, pid, n_pkt)
-                    parts.append(wf)
-                    parts.append(silence)
-            burst = np.concatenate(parts).astype(np.complex64)
-            if len(burst) > _BURST_LIMIT:
-                print(f"\n[WARN] burst {len(burst)} > {_BURST_LIMIT}, 截断 "
-                      f"(降低 jpeg/分辨率)")
-                burst = burst[:_BURST_LIMIT]
+                frame = get_next_frame(cap, frame_idx)
+                if frame is None:
+                    break
+                if h264_enc is not None:
+                    jpg = h264_enc.encode(frame)
+                    if not jpg:             # 编码器预热, 本源帧无输出
+                        cv2.imshow("TX", cv2.resize(frame, (480, 360)))
+                        cv2.waitKey(1)
+                        frame_idx += 1
+                        continue
+                else:
+                    jpg = frame_to_jpeg_bytes(frame, args.fwidth, args.fheight,
+                                              args.jpeg, codec=args.codec)
+                disp = cv2.resize(frame, (480, 360))
+
+            burst, n_pkt = _build_frame_burst(jpg, frame_idx, args)
             # baseband -> upsample/normalize -> cyclic 线程持续发当前帧
             tx.push(burst)
-            cv2.imshow("TX", cv2.resize(frame, (480, 360)))
+            cv2.imshow("TX", disp)
             if cv2.waitKey(1) == 27:
                 break
             elapsed = time.time() - t0
-            print(f"\r[TXVID] frame#{frame_idx} 包={n_pkt} JPEG={len(jpg)}B  "
+            print(f"\r[TXVID] frame#{frame_idx} 包={n_pkt} 帧={len(jpg)}B  "
                   f"{elapsed:.1f}s", end="")
             frame_idx += 1
             dt = time.time() - tframe
@@ -2181,7 +2277,8 @@ def run_txvideo(args):
             cap.release()
         cv2.destroyAllWindows()
         tx.close()
-    print(f"\n[TXVID] 结束, 共发射 {frame_idx} 帧")
+    el = max(time.time() - t0, 1e-3)
+    print(f"\n[TXVID] 结束, 共发射 {frame_idx} 帧 ({frame_idx/el:.1f} fps)")
 
 
 def run_rxvideo(args):
@@ -2205,9 +2302,10 @@ def run_rxvideo(args):
     cap_count = {"n": 0}
 
     def _capture_loop():
+        # 采集线程只做 recv (capture_rf), 下采样移到主线程, 把空口占空比拉满.
         while not stop_event.is_set():
             try:
-                s = rx.capture()
+                s = rx.capture_rf()
             except Exception:
                 continue
             if s is None or len(s) == 0:
@@ -2256,6 +2354,8 @@ def run_rxvideo(args):
                     break
                 continue
             n_cap = cap_count["n"]
+            # 下采样在此 (消费线程) 做, 不占用采集线程的 recv 时间. OSF=1 时直通.
+            samples = downsample_to_bb(samples)
             for st in detect_packets(samples, threshold=0.55):
                 res = decode_packet(samples, st)
                 if res is None:
@@ -2339,6 +2439,7 @@ def run_rxvideo(args):
 
 def main():
     global SAMPLE_RATE_BB, RF_RATE, RF_BANDWIDTH, _AV_CODEC
+    global OSF, _RESAMPLE_UP, _RESAMPLE_DOWN
     p = argparse.ArgumentParser(
         description="USRP x310 OFDM 彩色视频传输 (5.8 GHz, 802.11a 风格)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2380,13 +2481,13 @@ def main():
                    help="编码质量 1-100 (JPEG/WebP 共用此参数)")
     p.add_argument("--codec", default="jpg",
                    choices=["jpg", "webp", "h264", "h265"],
-                   help="帧编码: jpg / webp (~+30%质量) / h264 (~+50%质量)")
+                   help="帧编码: jpg / webp (~+30%%质量) / h264 (~+50%%质量)")
     p.add_argument("--h264-bitrate", type=int, default=500_000,
                    help="H.264 目标比特率 (bit/s). 默认 500kbps. "
                         "320x240 推荐 500-800k, 480x360 推荐 800-1500k")
     p.add_argument("--h264-gop", type=int, default=1,
                    help="H.264 GOP 长度. 默认 1 = 每帧独立 (intra-only), "
-                        "丢帧不影响后续, 9% 帧丢失环境下唯一可行选择. "
+                        "丢帧不影响后续, 9%% 帧丢失环境下唯一可行选择. "
                         "GOP>1 在丢帧链路上会卡屏到下次 IDR, 不推荐.")
     p.add_argument("--h264-preset", default="fast",
                    choices=["ultrafast", "superfast", "veryfast", "faster",
@@ -2400,7 +2501,7 @@ def main():
                         "越小越清晰, 推荐 20~26; 设了它就忽略 --h264-bitrate.")
     p.add_argument("--fec", action="store_true",
                    help="开启前向纠错(Reed-Solomon erasure): 收齐任意 k/n 个包即恢复整帧, "
-                        "在 16QAM 等丢包链路(CRC 80-95%)下稳定出帧. 收发两端须一致.")
+                        "在 16QAM 等丢包链路(CRC 80-95%%)下稳定出帧. 收发两端须一致.")
     p.add_argument("--fec-overhead", type=float, default=0.4,
                    help="FEC 冗余比例 (默认 0.4 = 40%% 冗余包). 丢包越多需越大; "
                         "0.4 可容忍约 28%% 丢包.")
@@ -2419,19 +2520,36 @@ def main():
                    help="基带采样率 MHz (默认 5). 提高=增带宽/吞吐, 支撑更高 fps "
                         "和更大分辨率. B210 over USB3 建议 ≤20 (RF=1.5x, ≤30MHz); "
                         "过高会因主机 CPU/USB 跟不上而掉帧. 收发两端必须一致.")
+    p.add_argument("--preencode", action="store_true",
+                   help="txvideo 文件源专用: 启动时一次性编码整段视频, 之后发射只切包/"
+                        "调制/推送, 不再受编码器吞吐 (如 720p ~10fps) 限制 -> 发射帧率冲到 "
+                        "空口/RX装配上限. 编码会在开头集中花一次时间.")
+    p.add_argument("--preencode-max", type=int, default=2000,
+                   help="--preencode 最多缓存帧数 (默认 2000, 防超大文件吃光内存).")
+    p.add_argument("--osf", type=float, default=1.5, choices=[1.0, 1.5],
+                   help="过采样因子 (RF=OSF*基带). 1.5=旧默认; "
+                        "1.0=不过采样 (RF=BB, 同 802.11a, 空子载波即保护带), 省掉 RX 端 "
+                        "~70%% 重采样开销 -> 采集占空比/帧率大涨, 强烈推荐. 同采样率下 "
+                        "1.0 与 1.5 的空口数据率完全相同. 收发两端必须一致.")
 
     args = p.parse_args()
     set_modulation(args.mod)
 
-    # 据 --samp-rate 覆盖全局采样率 (收发两端必须一致). OFDM 处理是按样本数,
-    # 与速率无关; 重采样比例固定 3/2, 故只需让 RF_RATE = OSF * 基带率.
+    # 据 --samp-rate / --osf 覆盖全局采样率 (收发两端必须一致). OFDM 处理按样本数,
+    # 与速率无关. OSF=1 时重采样直通 (UP==DOWN); OSF=1.5 时用 3/2.
     SAMPLE_RATE_BB = args.samp_rate * 1e6
-    RF_RATE = int(SAMPLE_RATE_BB * OSF)
+    OSF = args.osf
+    if abs(OSF - 1.0) < 1e-6:
+        _RESAMPLE_UP = _RESAMPLE_DOWN = 1
+    else:                                  # 1.5 (argparse choices 已限定)
+        _RESAMPLE_UP, _RESAMPLE_DOWN = 3, 2
+    RF_RATE = int(round(SAMPLE_RATE_BB * OSF))
     RF_BANDWIDTH = min(RF_RATE * 0.9, 56e6)
     _AV_CODEC = "hevc" if args.codec == "h265" else "h264"
 
     print(f"[CFG] modulation={_MOD_NAME}  bits/sym={_MOD_BITS_PER_SYM}")
     print(f"[CFG] 采样率 BB={SAMPLE_RATE_BB/1e6:.1f}MHz  RF={RF_RATE/1e6:.1f}MHz  "
+          f"OSF={OSF:g}{' (无重采样)' if _RESAMPLE_UP == _RESAMPLE_DOWN else ''}  "
           f"BW={RF_BANDWIDTH/1e6:.1f}MHz")
 
     if args.mode == "sim":
