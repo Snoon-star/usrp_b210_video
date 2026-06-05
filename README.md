@@ -41,14 +41,16 @@ Legacy behavior is still available with `--osf 1.5` (must match on both ends).
 The best `--gain` (TX) / `--rx-gain` (RX) depend on the environment (frequency,
 distance, antennas), so finding them by hand is tedious. `usrp_power_tune.py`
 sweeps a grid of `(tx_gain, rx_gain)` combos, measures real link quality for
-each, and prints the combo with the most CRC-passing packets plus a ready-to-run
+each, and prints the best combo by **true link PDR** plus a ready-to-run
 `txvideo`/`rxvideo` command pair.
 
 It reuses two existing diagnostic modes (no new RF code): `--mode txbeacon`
-transmits a fixed test burst at a given TX gain, and `--mode rxprobe` reports
-per-capture `det / LTS / HDR / CRC` stage counts. The tuner launches both as
-subprocesses, parses the cumulative CRC count, and ranks. (`txbeacon`/`rxprobe`
-now also honor `--tx-chan`/`--rx-chan`, required for U220202's RF B port.)
+transmits a fixed test burst at a given TX gain and periodically reports how many
+packets it has sent (`txpkts=`), and `--mode rxprobe` reports `det / LTS / HDR /
+CRC` stage counts plus its receive duty cycle (`duty=`). The tuner launches both
+as subprocesses and, for each gain combo, samples the transmitted-packet delta
+over the measurement window. (`txbeacon`/`rxprobe` now also honor
+`--tx-chan`/`--rx-chan`, required for U220202's RF B port.)
 
 Run it **inside the activated `u220` conda env** (workers inherit `sys.executable`):
 
@@ -63,10 +65,21 @@ python usrp_power_tune.py --dry-run              # print the commands only, no r
 Defaults: TX=`serial=U220202` on `--tx-chan 1` (RF B, since U220202's RF A is
 damaged), RX=`serial=U220213` on `--rx-chan 0`, `--samp-rate 20 --osf 1.0
 --mod qpsk`. Gain lists accept `a,b,c` or `start:stop:step`; results are written
-to `power_tune_results.csv`. `--rank` chooses the winning metric: `crc` (default
-= most CRC-passing packets = throughput, since all probes share one `--dwell`),
-`crclts` (highest per-packet success `crc/lts`, but only among combos with
-`crc >= max(3, 0.25×best)` so a "2 packets at 100%" fluke can't win), or
-`balanced` (`crc × crc/lts`). The default `--role both` assumes both B210s are on
-one host (like `--mode dual`); for a two-host setup run `--role tx` on the TX
-host and `--role rx` (parses + ranks) on the RX host with the same `--dwell`.
+to `power_tune_results.csv`. `--rank` chooses the winning metric:
+
+- **`pdr` (default)** — `CRC / (Δtx_packets × rx_duty)` = true per-packet link
+  success. Dividing by the TX-measured packet count removes transmit-FPS
+  fluctuation; dividing by the measured RX duty cycle removes receive blind-time
+  (which also compensates the heavier decode load at high gain). This is the
+  cleanest metric for *gain* tuning, since gain only changes per-packet success,
+  not transmit rate. Combos below an opportunity floor are excluded so a
+  tiny-sample fluke can't win.
+- `crc` — most CRC-passing packets per `--dwell` = throughput (mixes in TX-FPS, so
+  noisier for gain tuning, but matches the real time-bound video link).
+- `crclts` — highest `crc/lts` (partial PDR: denominator is RX-detected preambles,
+  so it over-credits weak gains). `balanced` — `crc × crc/lts`.
+
+`--role both` (default) assumes both B210s are on one host (like `--mode dual`) and
+is required for `pdr` (it needs the local beacon's `txpkts`); two-host setups use
+`--role tx` on the TX host and `--role rx` on the RX host (which falls back to
+`crc`, since it can't see the TX count) with the same `--dwell`.
