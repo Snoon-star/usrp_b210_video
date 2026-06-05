@@ -2007,7 +2007,8 @@ def run_txbeacon(args):
         print("[错误] 未安装 uhd")
         return
     uri = args.tx_uri if args.mode == "txbeacon" else args.uri
-    tx = UsrpTX(uri, args.freq * 1e6, args.gain, streaming=False)
+    tx = UsrpTX(uri, args.freq * 1e6, args.gain, streaming=False,
+                chan=args.tx_chan)
 
     # 用 192x144 测试图样生成一个 burst (固定内容, cyclic 重复发)
     h, w = 144, 192
@@ -2051,7 +2052,8 @@ def run_rxprobe(args):
         print("[错误] 未安装 uhd")
         return
     uri = args.rx_uri if args.mode == "rxprobe" else args.uri
-    rx = UsrpRX(uri, args.freq * 1e6, args.rx_gain, rx_buffer=2 ** 18)
+    rx = UsrpRX(uri, args.freq * 1e6, args.rx_gain, rx_buffer=2 ** 18,
+                chan=args.rx_chan)
     print(f"[PROBE] 监听 {uri} @ {args.freq:.1f} MHz, RX={args.rx_gain}dB.")
     print("        阶段意义: det = L-STF autocorr 触发数 (含噪声假阳性);")
     print("                  LTS = 找到合法 64-sample LTS 模板的检测点数;")
