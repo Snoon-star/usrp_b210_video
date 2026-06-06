@@ -81,6 +81,12 @@ to `power_tune_results.csv`. `--rank` chooses the winning metric:
 - `crclts` — highest `crc/lts` (partial PDR: denominator is RX-detected preambles,
   so it over-credits weak gains). `balanced` — `crc × crc/lts`.
 
+Each combo is sampled over `--repeat` windows (default 3) and scored by the
+**median** of its per-window PDRs, so a single window hit by transient
+interference (or a lucky one) can't decide the winner. The table and CSV report
+the window count (`n`) and the per-combo PDR `min–max` spread; `--repeat 1`
+restores the old single-window behavior (and roughly thirds the total sweep time).
+
 `--role both` (default) assumes both B210s are on one host (like `--mode dual`) and
 is required for `pdr` (it needs the local beacon's `txpkts`); two-host setups use
 `--role tx` on the TX host and `--role rx` on the RX host (which falls back to
