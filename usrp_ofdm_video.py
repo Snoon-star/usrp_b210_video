@@ -944,6 +944,7 @@ class UsrpTX:
         self._lock = threading.Lock()
         self._loop_thread = None
         self._loop_stop = threading.Event()
+        self._send_count = 0           # 累计成功 send() 次数 (= cyclic 发出的 burst 数)
         mode = "streaming(one-shot)" if streaming else "cyclic(thread-emul)"
         port = "RF B(TX/RX)" if self.chan == 1 else "RF A(TX/RX)"
         print(f"[TX]  就绪  Freq={freq/1e9:.2f}GHz  SR={RF_RATE/1e6:.1f}MHz  "
@@ -963,6 +964,7 @@ class UsrpTX:
                 continue
             try:
                 self.tx_streamer.send(burst, md, 0.5)
+                self._send_count += 1
             except Exception:
                 time.sleep(0.001)
 
@@ -2007,7 +2009,8 @@ def run_txbeacon(args):
         print("[错误] 未安装 uhd")
         return
     uri = args.tx_uri if args.mode == "txbeacon" else args.uri
-    tx = UsrpTX(uri, args.freq * 1e6, args.gain, streaming=False)
+    tx = UsrpTX(uri, args.freq * 1e6, args.gain, streaming=False,
+                chan=args.tx_chan)
 
     # 用 192x144 测试图样生成一个 burst (固定内容, cyclic 重复发)
     h, w = 144, 192
@@ -2030,19 +2033,24 @@ def run_txbeacon(args):
     print(f"[BEACON] 固定 burst: {len(chunks)} 包, JPEG={len(jpg)}B, "
           f"{len(burst)} baseband samples")
 
+    n_pkt_per_burst = len(chunks)      # 每次 cyclic send 发出的包数 (K)
     try:
         tx.push(burst)
         print(f"[BEACON] 持续发射中 (cyclic, freq={args.freq:.1f}MHz, "
-              f"TX_GAIN={args.gain}dB). Ctrl+C 停止.")
+              f"TX_GAIN={args.gain}dB, K={n_pkt_per_burst}pkt/burst). Ctrl+C 停止.",
+              flush=True)
         t0 = time.time()
         while time.time() - t0 < args.duration:
-            time.sleep(0.5)
-            print(f"\r[BEACON] elapsed {time.time()-t0:.1f}s", end="")
+            time.sleep(0.3)
+            # 周期换行上报累计已发包数, 供 power_tune 取窗口内 Δ 发射包数算 PDR
+            print(f"[BEACON] elapsed {time.time()-t0:.1f}s "
+                  f"txpkts={tx._send_count * n_pkt_per_burst}", flush=True)
     except KeyboardInterrupt:
         pass
     finally:
         tx.close()
-    print("\n[BEACON] 已停止")
+    print(f"[BEACON] 已停止 (共 {tx._send_count} bursts, "
+          f"{tx._send_count * n_pkt_per_burst} pkts)", flush=True)
 
 
 def run_rxprobe(args):
@@ -2051,7 +2059,8 @@ def run_rxprobe(args):
         print("[错误] 未安装 uhd")
         return
     uri = args.rx_uri if args.mode == "rxprobe" else args.uri
-    rx = UsrpRX(uri, args.freq * 1e6, args.rx_gain, rx_buffer=2 ** 18)
+    rx = UsrpRX(uri, args.freq * 1e6, args.rx_gain, rx_buffer=2 ** 18,
+                chan=args.rx_chan)
     print(f"[PROBE] 监听 {uri} @ {args.freq:.1f} MHz, RX={args.rx_gain}dB.")
     print("        阶段意义: det = L-STF autocorr 触发数 (含噪声假阳性);")
     print("                  LTS = 找到合法 64-sample LTS 模板的检测点数;")
@@ -2062,11 +2071,13 @@ def run_rxprobe(args):
     print("        HDR>0 但 CRC=0 → 包大体能解, BER 偏高.")
     t0 = time.time()
     n = 0
+    rf_samps = 0                       # 累计采集的 RF 样本数, 用于算占空比
     cum = {"det": 0, "lts": 0, "hdr": 0, "crc": 0}
     try:
         while time.time() - t0 < args.duration:
             samples = rx.capture()
             n += 1
+            rf_samps += rx.rx_buffer
             rms = float(np.sqrt(np.mean(np.abs(samples) ** 2)))
             peak = float(np.max(np.abs(samples)))
             # 单次 metric 峰值: 反映 autocorr 信号-噪声比, 真信号一般 >0.85
@@ -2119,8 +2130,12 @@ def run_rxprobe(args):
         pass
     finally:
         rx.close()
+    elapsed = max(time.time() - t0, 1e-9)
+    # 占空比 = 实际采集的 RF 样本数 / 同期空口总样本数; 调谐器据此把 RX 盲区
+    # (含高增益时解码变慢导致的更长处理间隙) 从 PDR 里除掉 -> 还原真链路成功率.
+    duty = rf_samps / (elapsed * RF_RATE) if RF_RATE > 0 else 0.0
     print(f"\n[结果] {n} 次 capture, 累计 det={cum['det']} LTS={cum['lts']} "
-          f"HDR={cum['hdr']} CRC={cum['crc']}")
+          f"HDR={cum['hdr']} CRC={cum['crc']} duty={duty*100:.1f}%")
 
 
 # ============================================================================
