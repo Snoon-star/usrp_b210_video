@@ -18,6 +18,8 @@ USRP B210 收发功率自动调试 (U220202 TX / U220213 RX)
             分母是 "TX 发出且 RX 在听" 的接收机会数 -> 把 **发射FPS波动** 和
             **RX占空比**(含高增益时解码变慢) 都除掉, 只剩链路本身的成功率.
             这是给"调增益"用的最干净指标 (增益只影响每包成功率, 不影响发射速率).
+            每个组合默认采 --repeat 个窗口, PDR 取各窗**中位数** (抗单窗瞬时干扰);
+            表格/CSV 附 min–max 波动.
   crc     = 累计 CRC 好包数 (按时间) = 吞吐. 但掺了发射FPS/占空比, 调增益时是噪声.
   crclts  = crc/lts (每包成功率的半成品: 分母是 RX 检测到的前导, 漏掉没检测到的).
   balanced= crc × (crc/lts).
@@ -268,16 +270,59 @@ def _attach_pdr(r):
     return r
 
 
+def _median(xs):
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return None
+    mid = n // 2
+    return s[mid] if n % 2 else 0.5 * (s[mid - 1] + s[mid])
+
+
+def _aggregate_windows(windows):
+    """把同一 (tx,rx) 组合的 N 个窗口测量聚合成一条结果.
+
+    PDR 取各窗 PDR 的**中位数** (抗单窗瞬时干扰); cap/det/lts/hdr/crc 累加,
+    duty 取均值, 并记录各窗 PDR 的 min/max 反映波动. N=1 时与单窗等价."""
+    agg = dict(windows[0])                       # 沿用 tx_gain/rx_gain 等
+    _sum = lambda key: sum(w.get(key) or 0 for w in windows)
+    agg["cap"] = _sum("cap")
+    agg["det"] = _sum("det")
+    agg["lts"] = _sum("lts")
+    agg["hdr"] = _sum("hdr")
+    agg["crc"] = _sum("crc")
+    agg["crc_lts_pct"] = (100.0 * agg["crc"] / agg["lts"]) if agg["lts"] else 0.0
+    agg["elapsed"] = _sum("elapsed")
+    dtxs = [w["dtx"] for w in windows if w.get("dtx") is not None]
+    agg["dtx"] = sum(dtxs) if dtxs else None
+    opps = [w["opp"] for w in windows if w.get("opp") is not None]
+    agg["opp"] = sum(opps) if opps else None
+    duties = [w["duty_pct"] for w in windows if w.get("duty_pct") is not None]
+    agg["duty_pct"] = (sum(duties) / len(duties)) if duties else None
+    pdrs = [w["pdr_pct"] for w in windows if w.get("pdr_pct") is not None]
+    agg["pdr_pct"] = _median(pdrs)
+    agg["pdr_min"] = min(pdrs) if pdrs else None
+    agg["pdr_max"] = max(pdrs) if pdrs else None
+    agg["n_win"] = len(windows)
+    agg["n_pdr"] = len(pdrs)
+    agg["parsed"] = all(w.get("parsed") for w in windows)
+    agg["tail"] = windows[-1].get("tail")
+    return agg
+
+
 def _fmt(x, spec, none="  - "):
     return (format(x, spec) if x is not None else none)
 
 
 def _row(done, total, r):
+    spread = ""
+    if r.get("n_win", 1) > 1 and r.get("pdr_min") is not None:
+        spread = f" [{r['n_win']}窗 {r['pdr_min']:.1f}–{r['pdr_max']:.1f}]"
     return (f"  [{done:2d}/{total}] tx={_fmt(r['tx_gain'], '<4g')} "
             f"rx={r['rx_gain']:<4g} | crc={r['crc']:<4d} "
             f"duty={_fmt(r['duty_pct'], '4.1f')}% "
             f"txΔ={_fmt(r['dtx'], '<5d')} "
-            f"pdr={_fmt(r['pdr_pct'], '5.1f')}% "
+            f"pdr={_fmt(r['pdr_pct'], '5.1f')}%" + spread + " "
             f"| lts={r['lts']:<4d} crc/lts={r['crc_lts_pct']:4.1f}%"
             + ("" if r["parsed"] else "  [未解析!]"))
 
@@ -289,11 +334,11 @@ def sweep_both(args, tx_gains, rx_gains):
     results = []
     total = len(tx_gains) * len(rx_gains)
     done = 0
-    per_probe = args.dwell + 40 + args.settle
+    per_probe = (args.dwell + 40 + args.settle) * args.repeat
     beacon_dur = args.warmup + len(rx_gains) * per_probe + 15
 
     print(f"[扫描] 共 {total} 组合  (tx_gains={tx_gains}  rx_gains={rx_gains})  "
-          f"dwell={args.dwell}s  rank={args.rank}")
+          f"dwell={args.dwell}s×{args.repeat}窗  rank={args.rank}")
     print(f"[扫描] TX={args.tx_uri} chan{args.tx_chan}  "
           f"RX={args.rx_uri} chan{args.rx_chan}  "
           f"freq={args.freq}MHz samp={args.samp_rate} osf={args.osf} mod={args.mod}")
@@ -319,20 +364,32 @@ def sweep_both(args, tx_gains, rx_gains):
 
             for rx_gain in rx_gains:
                 done += 1
-                print(f"  [{done:2d}/{total}] tx={tx_gain:<4g} rx={rx_gain:<4g} "
-                      f"测量 {args.dwell}s ...", end="", flush=True)
-                p0 = drain.latest_txpkts()
-                r = run_probe_once(args, rx_gain)
-                p1 = drain.latest_txpkts()
-                if r is None:
-                    _stop(beacon)
-                    return results
-                r["tx_gain"] = tx_gain
-                if p0 is not None and p1 is not None and p1 >= p0:
-                    r["dtx"] = p1 - p0
-                _attach_pdr(r)
+                windows = []
+                for k in range(args.repeat):
+                    tag = f" 窗{k + 1}/{args.repeat}" if args.repeat > 1 else ""
+                    print(f"  [{done:2d}/{total}] tx={tx_gain:<4g} rx={rx_gain:<4g}{tag} "
+                          f"测量 {args.dwell:g}s ...", end="", flush=True)
+                    p0 = drain.latest_txpkts()
+                    w = run_probe_once(args, rx_gain)
+                    p1 = drain.latest_txpkts()
+                    if w is None:
+                        _stop(beacon)
+                        return results
+                    w["tx_gain"] = tx_gain
+                    if p0 is not None and p1 is not None and p1 >= p0:
+                        w["dtx"] = p1 - p0
+                    _attach_pdr(w)
+                    windows.append(w)
+                    if args.repeat > 1:
+                        print(f"\r  [{done:2d}/{total}] tx={tx_gain:<4g} "
+                              f"rx={rx_gain:<4g} 窗{k + 1}/{args.repeat}: "
+                              f"crc={w['crc']:<4d} pdr={_fmt(w['pdr_pct'], '5.1f')}%"
+                              f"{' ' * 8}")
+                    if k < args.repeat - 1:
+                        time.sleep(args.settle)
+                r = _aggregate_windows(windows)
                 results.append(r)
-                print("\r" + _row(done, total, r))
+                print(("     " if args.repeat > 1 else "\r") + _row(done, total, r))
                 if not r["parsed"] and r["tail"]:
                     for ln in r["tail"]:
                         print(f"        | {ln}")
@@ -443,11 +500,12 @@ def summarize(args, results):
     print(f"[排名 --rank {mode}] {note}")
     print("-" * 78)
     print(f"{'#':>2}  {'tx':>4} {'rx':>4} | {'crc':>5} {'duty':>5} "
-          f"{'txΔ':>6} {'pdr':>6} | {'lts':>5} {'crc/lts':>7}")
+          f"{'txΔ':>6} {'pdr':>6} {'n':>2} | {'lts':>5} {'crc/lts':>7}")
     for i, r in enumerate(ranked[:12], 1):
         print(f"{i:>2}  {_fmt(r['tx_gain'], '>4g')} {r['rx_gain']:>4g} | "
               f"{r['crc']:>5d} {_fmt(r['duty_pct'], '>4.1f')}% "
-              f"{_fmt(r['dtx'], '>6d')} {_fmt(r['pdr_pct'], '>5.1f')}% | "
+              f"{_fmt(r['dtx'], '>6d')} {_fmt(r['pdr_pct'], '>5.1f')}% "
+              f"{r.get('n_win', 1):>2d} | "
               f"{r['lts']:>5d} {r['crc_lts_pct']:>6.1f}%")
 
     best = ranked[0]
@@ -464,7 +522,11 @@ def summarize(args, results):
         return
 
     tg = best["tx_gain"]
-    extra = (f"PDR={best['pdr_pct']:.1f}%, CRC={best['crc']}"
+    spread = ""
+    if best.get("n_win", 1) > 1 and best.get("pdr_min") is not None:
+        spread = (f" [{best['n_win']}窗中位, "
+                  f"{best['pdr_min']:.1f}–{best['pdr_max']:.1f}]")
+    extra = (f"PDR={best['pdr_pct']:.1f}%{spread}, CRC={best['crc']}"
              if mode == "pdr" and best.get("pdr_pct") is not None
              else f"CRC={best['crc']}/{args.dwell:g}s, crc/lts={best['crc_lts_pct']:.1f}%")
     print("\n[推荐] 最佳组合: "
@@ -498,7 +560,8 @@ def _write_csv(args, results):
         w.writerow(["freq_mhz", "samp_rate", "osf", "mod",
                     "tx_gain", "rx_gain", "captures", "det", "lts", "hdr",
                     "crc", "crc_over_lts_pct", "duty_pct", "txpkts_delta",
-                    "opportunities", "pdr_pct", "parsed"])
+                    "opportunities", "pdr_pct", "n_windows", "pdr_min",
+                    "pdr_max", "parsed"])
         for r in results:
             w.writerow([args.freq, args.samp_rate, args.osf, args.mod,
                         r["tx_gain"], r["rx_gain"], r["cap"], r["det"],
@@ -508,6 +571,9 @@ def _write_csv(args, results):
                         ("" if r["dtx"] is None else r["dtx"]),
                         ("" if r["opp"] is None else f"{r['opp']:.0f}"),
                         ("" if r["pdr_pct"] is None else f"{r['pdr_pct']:.1f}"),
+                        r.get("n_win", 1),
+                        ("" if r.get("pdr_min") is None else f"{r['pdr_min']:.1f}"),
+                        ("" if r.get("pdr_max") is None else f"{r['pdr_max']:.1f}"),
                         int(r["parsed"])])
 
 
@@ -540,7 +606,10 @@ def main():
     p.add_argument("--rx-gains", default=None,
                    help="RX 增益列表, 同上. 不给则按 --freq 自动选")
     p.add_argument("--dwell", type=float, default=6.0,
-                   help="每个组合的测量时长 s (默认 6)")
+                   help="每个组合每个窗口的测量时长 s (默认 6)")
+    p.add_argument("--repeat", type=int, default=3,
+                   help="每个组合重复采样的窗口数, PDR 取各窗中位数以抗瞬时抖动 "
+                        "(默认 3; 设 1 = 旧的单窗行为)")
     p.add_argument("--warmup", type=float, default=2.5,
                    help="beacon 启动后等待暖机的秒数 (默认 2.5)")
     p.add_argument("--settle", type=float, default=1.0,
@@ -554,6 +623,7 @@ def main():
     p.add_argument("--dry-run", action="store_true",
                    help="只打印将要执行的子进程命令, 不真正跑")
     args = p.parse_args()
+    args.repeat = max(1, args.repeat)
 
     dtx, drx = _default_gains(args.freq)
     tx_gains = _parse_gain_list(args.tx_gains) if args.tx_gains else dtx
@@ -564,7 +634,8 @@ def main():
         sys.exit(1)
 
     if args.dry_run:
-        print("[dry-run] role =", args.role, " rank =", args.rank)
+        print("[dry-run] role =", args.role, " rank =", args.rank,
+              " repeat =", args.repeat)
         if args.role in ("both", "tx"):
             print("[dry-run] beacon 命令样例 (tx_gain=%g):" % tx_gains[0])
             print("    " + " ".join(_beacon_cmd(args, tx_gains[0], args.dwell + 5)))
