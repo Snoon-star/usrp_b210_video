@@ -91,3 +91,5 @@ restores the old single-window behavior (and roughly thirds the total sweep time
 is required for `pdr` (it needs the local beacon's `txpkts`); two-host setups use
 `--role tx` on the TX host and `--role rx` on the RX host (which falls back to
 `crc`, since it can't see the TX count) with the same `--dwell`.
+
+Attention: TX init time is long, almost 10 seconds.

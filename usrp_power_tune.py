@@ -610,8 +610,8 @@ def main():
     p.add_argument("--repeat", type=int, default=3,
                    help="每个组合重复采样的窗口数, PDR 取各窗中位数以抗瞬时抖动 "
                         "(默认 3; 设 1 = 旧的单窗行为)")
-    p.add_argument("--warmup", type=float, default=2.5,
-                   help="beacon 启动后等待暖机的秒数 (默认 2.5)")
+    p.add_argument("--warmup", type=float, default=10,
+                   help="beacon 启动后等待暖机的秒数 (默认 10)")
     p.add_argument("--settle", type=float, default=1.0,
                    help="组合之间留给 USB 设备释放的间隔 s (默认 1.0)")
     p.add_argument("--rank", default="pdr",
